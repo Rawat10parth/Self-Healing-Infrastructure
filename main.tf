@@ -100,7 +100,7 @@ resource "aws_lb_listener" "app_lb_listener" {
 
 # Auto scaling Launch Configuration
 resource "aws_launch_configuration" "app" {
-  name            = "app-launch-config"
+  name            = "app-launch-config-v1"
   image_id        = "ami-02b49a24cfb95941c"
   instance_type   = "t2.micro"
   security_groups = [aws_security_group.web_sg.id]
@@ -116,6 +116,8 @@ resource "aws_launch_configuration" "app" {
               sudo yum install -y httpd
               sudo systemctl start httpd
               sudo systemctl enable httpd
+              echo '<html><body><h1>Welcome to my website!</h1></body></html>' | sudo tee /var/www/html/index.html
+              sudo systemctl restart httpd
               EOF
 }
 
