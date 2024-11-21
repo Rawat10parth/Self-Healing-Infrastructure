@@ -11,10 +11,91 @@ provider "aws" {
   region = "ap-south-1"
 }
 
+# Create an IAM Role for EC2 instance
+resource "aws_iam_role" "ec2_cloudwatch_role" {
+  name = "EC2CloudWatchRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# Attach the necessary policy to allow CloudWatch actions
+resource "aws_iam_policy" "cloudwatch_policy" {
+  name        = "CloudWatchLogsPolicy"
+  description = "Policy to allow EC2 to write logs to CloudWatch"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect   = "Allow",
+        Action   = [
+          "logs:PutLogEvents",
+          "logs:CreateLogStream",
+          "logs:DescribeLogStreams",
+          "logs:CreateLogGroup",
+          "logs:DescribeLogGroups",
+          "cloudwatch:PutMetricData",
+          "ec2:DescribeTags",
+          "autoscaling:DescribeAutoScalingGroups",
+          "ssm:GetParameter",
+          "ssm:PutParameter",
+          "ssm:DescribeParameters",
+          "ssm:ListAssociations",
+          "ssm:UpdateInstanceInformation"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Add SSM policy attachments to the EC2 role
+resource "aws_iam_role_policy_attachment" "ssm_policy_attachment" {
+  role       = aws_iam_role.ec2_cloudwatch_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "cloudwatch_policy_attachment" {
+  role       = aws_iam_role.ec2_cloudwatch_role.name
+  policy_arn = aws_iam_policy.cloudwatch_policy.arn
+}
+
+# IAM Instance Profile for EC2
+resource "aws_iam_instance_profile" "ec2_cloudwatch_instance_profile" {
+  name = "CloudWatchAgentInstanceProfile"
+  role = aws_iam_role.ec2_cloudwatch_role.name
+}
+
+# Attach the CloudWatch policy to the EC2 IAM role
+resource "aws_iam_role_policy_attachment" "ec2_cloudwatch_attachment" {
+  role       = aws_iam_role.ec2_cloudwatch_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+# Attach CloudWatchFullAccess policy to the EC2 role
+resource "aws_iam_role_policy_attachment" "cloudwatch_full_access" {
+  role       = aws_iam_role.ec2_cloudwatch_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchFullAccess"
+}
+
+
 resource "aws_instance" "terraform-demo" {
   ami             = "ami-02b49a24cfb95941c"
   instance_type   = "t2.micro"
   vpc_security_group_ids = [aws_security_group.web_sg.id]
+  
+  iam_instance_profile = aws_iam_instance_profile.ec2_cloudwatch_instance_profile.name
   
   tags = {
     Name = "Self-Healing-EC2"
@@ -25,9 +106,77 @@ resource "aws_instance" "terraform-demo" {
               #!/bin/bash
               apt-get update -y
               apt-get install -y apache2
+              apt-get install -y amazon-cloudwatch-agent
+              apt-get install -y awslogs
               systemctl start apache2
               systemctl enable apache2
+              systemctl start awslogsd
+              systemctl enable awslogsd.service
               echo "<html><body><h1>Welcome to the Self-Healing Infrastructure!</h1></body></html>" > /var/www/html/index.html
+              
+              mkdir -p /opt/aws/amazon-cloudwatch-agent/etc/
+              
+              # Create CloudWatch Agent configuration
+              cat <<EOT > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+              {
+                "agent": {
+                  "metrics_collection_interval": 60,
+                  "run_as_user": "root",
+                  "debug": true
+                },
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {
+                          "file_path": "/var/log/apache2/access.log",
+                          "log_group_name": "/ec2/instance-logs",
+                          "log_stream_name": "{instance_id}-access",
+                          "timestamp_format": "%d/%b/%Y:%H:%M:%S %z"
+                        },
+                        {
+                          "file_path": "/var/log/apache2/error.log",
+                          "log_group_name": "/ec2/instance-logs",
+                          "log_stream_name": "{instance_id}-error",
+                          "timestamp_format": "%b %d %H:%M:%S.%L %Y"
+                        },
+                        {
+                          "file_path": "/var/log/syslog",
+                          "log_group_name": "/ec2/instance-logs",
+                          "log_stream_name": "{instance_id}-syslog",
+                          "timestamp_format": "%b %d %H:%M:%S"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "metrics": {
+                  "metrics_collected": {
+                    "mem": {
+                      "measurement": ["mem_used_percent"]
+                    },
+                    "swap": {
+                      "measurement": ["swap_used_percent"]
+                    }
+                  }
+                }
+              }
+              EOT
+
+              # Set proper permissions
+              chmod 644 /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+              # Start CloudWatch Agent with custom configuration
+              sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 \
+              -c ssm:/AmazonCloudWatch-agent-config \
+              -s
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a start
+
+              # Ensure Apache2 logs are readable by CloudWatch agent
+              chmod 644 /var/log/apache2/access.log
+              chmod 644 /var/log/apache2/error.log
+              
               EOF
 }
 
@@ -109,15 +258,95 @@ resource "aws_launch_configuration" "app" {
     create_before_destroy = true
   }
 
+  # Add IAM instance profile to the launch configuration
+  iam_instance_profile = aws_iam_instance_profile.ec2_cloudwatch_instance_profile.name
+
   # User data script to install and start a web server
   user_data = <<-EOF
               #!/bin/bash
               sudo yum update -y
               sudo yum install -y httpd
+              sudo yum install -y amazon-cloudwatch-agent
+              sudo yum install -y awslogs
               sudo systemctl start httpd
               sudo systemctl enable httpd
+              sudo systemctl start awslogsd
+              sudo systemctl enable awslogsd.service
               echo '<html><body><h1>Welcome to my website!</h1></body></html>' | sudo tee /var/www/html/index.html
-              sudo systemctl restart httpd
+              
+              # Create CloudWatch Agent configuration directory
+              mkdir -p /opt/aws/amazon-cloudwatch-agent/etc/
+              
+              # Create CloudWatch Agent configuration
+              cat <<EOT > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+              {
+                "agent": {
+                  "metrics_collection_interval": 10,
+                  "run_as_user": "root"
+                  "debug":true
+                },
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {
+                          "file_path": "/var/log/httpd/access_log",
+                          "log_group_name": "/ec2/instance-logs",
+                          "log_stream_name": "{instance_id}-access",
+                          "timestamp_format": "%d/%b/%Y:%H:%M:%S %z"
+                        },
+                        {
+                          "file_path": "/var/log/httpd/error_log",
+                          "log_group_name": "/ec2/instance-logs",
+                          "log_stream_name": "{instance_id}-error",
+                          "timestamp_format": "%b %d %H:%M:%S.%L %Y"
+                        },
+                        {
+                          "file_path": "/var/log/messages",
+                          "log_group_name": "/ec2/instance-logs",
+                          "log_stream_name": "{instance_id}-system",
+                          "timestamp_format": "%b %d %H:%M:%S"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "metrics": {
+                  "metrics_collected": {
+                    "mem": {
+                      "measurement": ["mem_used_percent"]
+                    },
+                    "swap": {
+                      "measurement": ["swap_used_percent"]
+                    },
+                    "cpu": {
+                      "measurement": [
+                        "cpu_usage_idle",
+                        "cpu_usage_user",
+                        "cpu_usage_system"
+                      ],
+                      "metrics_collection_interval": 10
+                    }
+                  },
+                  "append_dimensions": {
+                    "AutoScalingGroupName": "$${aws:AutoScalingGroupName}",
+                    "InstanceId": "$${aws:InstanceId}",
+                    "InstanceType": "$${aws:InstanceType}"
+                  }
+                }
+              }
+              EOT
+
+                # Set proper permissions
+              chmod 644 /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+              # Start CloudWatch Agent with custom configuration
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a start
+
+              # Ensure Apache logs are readable by CloudWatch agent
+              chmod 644 /var/log/httpd/*log
+              
               EOF
 }
 
@@ -140,6 +369,12 @@ resource "aws_autoscaling_group" "app_asg" {
   }
 }
 
+# Define the CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "ec2_log_group" {
+  name              = "/ec2/instance-logs"
+  retention_in_days = 30
+}
+
 resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   alarm_name          = "HighCPUAlarm"
   comparison_operator = "GreaterThanOrEqualToThreshold"
@@ -148,8 +383,8 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   namespace           = "AWS/EC2"
   period              = "300"
   statistic           = "Average"
-  threshold           = "80"
-  alarm_description   = "This alarm triggers if the CPU utilization is 80% or higher for 10 minutes."
+  threshold           = "50"
+  alarm_description   = "This alarm triggers if the CPU utilization is 50% or higher for 10 minutes."
   dimensions = {
     InstanceId = aws_instance.terraform-demo.id
   }
